@@ -85,6 +85,13 @@
         }
       }
     },
+    "imagePullSecrets": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
     "workers": {
       "type": "object",
       "required": [

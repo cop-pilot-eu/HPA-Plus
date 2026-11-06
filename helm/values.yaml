@@ -5,6 +5,9 @@ image:
   # Defaults to Chart.appVersion. Override when installing your own build.
   tag: ""
   pullPolicy: IfNotPresent
+# Names of existing kubernetes.io/dockerconfigjson Secrets in the release namespace,
+# used to pull the image from a private registry. Example: ["harbor-creds"].
+imagePullSecrets: []
 
 replicaCount: 1
 leaderElection: true

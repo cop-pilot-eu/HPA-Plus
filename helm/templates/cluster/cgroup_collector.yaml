@@ -73,6 +73,12 @@ spec:
         app.kubernetes.io/component: cgroup-collector
     spec:
       serviceAccountName: {{ .Chart.Name }}-cgroup
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+      {{- range . }}
+      - name: {{ . | quote }}
+      {{- end }}
+      {{- end }}
       terminationGracePeriodSeconds: 10
       nodeSelector:
         {{- toYaml .Values.cgroupCollector.nodeSelector | nindent 8 }}

@@ -26,6 +26,12 @@ spec:
         name: {{ .Chart.Name }}
     spec:
       serviceAccountName: {{ .Chart.Name }}-cluster
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- range . }}
+        - name: {{ . | quote }}
+        {{- end }}
+      {{- end }}
       {{- if .Values.workerIsolation.enabled }}
       automountServiceAccountToken: false
       {{- end }}

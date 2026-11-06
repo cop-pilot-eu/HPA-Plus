@@ -1,0 +1,301 @@
+// Jenkins pipeline: test, build and publish the HPA+ operator image and Helm chart to Harbor,
+// then deploy to Kubernetes the same way as the main README (helm upgrade --install ./helm).
+// See jenkins/README.md for agent requirements, credentials and parameters.
+
+pipeline {
+    agent { label params.AGENT_LABEL ?: '' }
+
+    options {
+        timestamps()
+        disableConcurrentBuilds()
+        buildDiscarder(logRotator(numToKeepStr: '20'))
+        timeout(time: 60, unit: 'MINUTES')
+    }
+
+    parameters {
+        string(name: 'AGENT_LABEL', defaultValue: 'cop-pilot-staging-cluster',
+               description: 'Jenkins agent label. The agent needs Docker, helm (>= 3.8) and kubectl. Empty means any agent.')
+        string(name: 'KUBECONFIG_CREDENTIALS_ID', defaultValue: 'staging-kubeconfig',
+               description: 'Jenkins "Secret file" credential holding the kubeconfig of the target cluster.')
+        string(name: 'KUBE_CONTEXT', defaultValue: '',
+               description: 'kubeconfig context to deploy to. Empty uses the current context of the kubeconfig.')
+        string(name: 'NAMESPACE', defaultValue: 'hpa-plus-system',
+               description: 'Namespace for the operator release.')
+        string(name: 'RELEASE_NAME', defaultValue: 'hpa-plus-operator',
+               description: 'Helm release name.')
+        string(name: 'TARGET_KUBE_VERSION', defaultValue: '1.30.0',
+               description: 'Kubernetes version used by the offline helm lint/template checks. The chart requires >= 1.23.')
+        string(name: 'HELM_VALUES_FILE', defaultValue: '',
+               description: 'Optional values file, relative to the repository root, applied on top of the chart values.')
+        booleanParam(name: 'RUN_TESTS', defaultValue: true,
+                     description: 'Run go vet, the Go tests and the Python model tests before building.')
+        booleanParam(name: 'DEPLOY', defaultValue: true,
+                     description: 'Publish the image and chart to Harbor and deploy. When false, the pipeline stops after the build and Helm checks.')
+    }
+
+    environment {
+        // Harbor registry and project.
+        DOCKER_REG = 'harbor.cop-pilot.rid-intrasoft.eu'
+        DOCKER_REG_CREDS = 'harbor-creds'
+        DOCKER_REPO = '/hpa-plus/'
+
+        IMAGE_NAME = 'hpa-plus-operator'
+        // Must match `name` in helm/Chart.yaml; helm push stores the chart under <repo>/charts/<name>.
+        CHART_NAME = 'hpa-plus-operator'
+        // The operator Deployment is named after the chart, not the release.
+        DEPLOYMENT_NAME = 'hpa-plus-operator'
+        HELM_TIMEOUT = '10m'
+        // Image pull Secret created in the release namespace from harbor-creds.
+        PULL_SECRET_NAME = 'harbor-creds'
+
+        // Keep registry logins inside this build's workspace instead of the agent user's home.
+        DOCKER_CONFIG = "${WORKSPACE}/.ci/docker"
+        HELM_REGISTRY_CONFIG = "${WORKSPACE}/.ci/helm/registry.json"
+    }
+
+    stages {
+        stage('Prepare') {
+            steps {
+                script {
+                    def sha = sh(script: 'git rev-parse --short=12 HEAD', returnStdout: true).trim()
+                    def baseChartVersion = sh(script: "sed -n 's/^version:[[:space:]]*//p' helm/Chart.yaml | tr -d '\"'",
+                                              returnStdout: true).trim()
+                    if (!baseChartVersion) {
+                        error('Could not read version from helm/Chart.yaml')
+                    }
+                    env.IMAGE_TAG = sha
+                    // e.g. harbor.cop-pilot.rid-intrasoft.eu/hpa-plus/hpa-plus-operator
+                    env.IMAGE_REPO = "${env.DOCKER_REG}${env.DOCKER_REPO}${env.IMAGE_NAME}"
+                    env.IMAGE_REF = "${env.IMAGE_REPO}:${env.IMAGE_TAG}"
+                    // e.g. oci://harbor.cop-pilot.rid-intrasoft.eu/hpa-plus/charts
+                    env.CHART_REPO = "oci://${env.DOCKER_REG}${env.DOCKER_REPO}charts"
+                    env.CHART_REF = "${env.CHART_REPO}/${env.CHART_NAME}"
+                    // Unique per commit, e.g. 0.14.0-hpaplus-g1a2b3c4d5e6f. The 'g' prefix keeps an all-digit
+                    // SHA a valid SemVer pre-release identifier.
+                    env.CHART_VERSION = "${baseChartVersion}-g${sha}"
+                    // Multibranch PR builds never publish or deploy.
+                    env.IS_CHANGE_REQUEST = env.CHANGE_ID ? 'true' : 'false'
+                    currentBuild.displayName = "#${env.BUILD_NUMBER} ${env.IMAGE_TAG}"
+                    if (params.HELM_VALUES_FILE?.trim() && !fileExists(params.HELM_VALUES_FILE.trim())) {
+                        error("HELM_VALUES_FILE '${params.HELM_VALUES_FILE}' does not exist in the checkout")
+                    }
+                }
+                sh 'mkdir -p "$DOCKER_CONFIG" "$(dirname "$HELM_REGISTRY_CONFIG")" dist'
+                echo "Image: ${env.IMAGE_REF}"
+                echo "Chart: ${env.CHART_REF} version ${env.CHART_VERSION}"
+            }
+        }
+
+        stage('Test') {
+            when { expression { params.RUN_TESTS } }
+            parallel {
+                stage('Go') {
+                    agent {
+                        docker {
+                            // Same Go toolchain as the Dockerfile builder stage.
+                            image 'golang:1.27.1@sha256:3680233e3204827fbdc66088528ae6d4b3d034f51d03a99d454f6de034888244'
+                            reuseNode true
+                        }
+                    }
+                    environment {
+                        // The container runs as the Jenkins user, so keep caches in the workspace.
+                        GOPATH = "${WORKSPACE}/.cache/go"
+                        GOCACHE = "${WORKSPACE}/.cache/go-build"
+                        GOMODCACHE = "${WORKSPACE}/.cache/go-mod"
+                        GOFLAGS = '-buildvcs=false'
+                    }
+                    steps {
+                        sh '''
+                            go version
+                            go vet ./...
+                            go test ./...
+                        '''
+                    }
+                }
+                stage('Python') {
+                    agent {
+                        docker {
+                            // Same Python as the runtime image; the full variant already ships libgomp1 for XGBoost/LightGBM.
+                            image 'python:3.14.7-trixie'
+                            reuseNode true
+                        }
+                    }
+                    environment {
+                        PIP_CACHE_DIR = "${WORKSPACE}/.cache/pip"
+                        PIP_DISABLE_PIP_VERSION_CHECK = '1'
+                    }
+                    steps {
+                        sh '''
+                            python -m venv .venv
+                            . .venv/bin/activate
+                            pip install --require-hashes -r algorithms/requirements.txt
+                            pip install pytest==9.1.1
+                            pytest --import-mode=importlib algorithms/ \
+                                --junitxml=python-test-results.xml
+                        '''
+                    }
+                    post {
+                        always {
+                            junit allowEmptyResults: true, testResults: 'python-test-results.xml'
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Helm checks and package') {
+            steps {
+                script {
+                    def valuesArg = params.HELM_VALUES_FILE?.trim() ? "-f '${params.HELM_VALUES_FILE.trim()}'" : ''
+                    sh """
+                        helm version
+                        helm lint ./helm ${valuesArg} \
+                            --kube-version '${params.TARGET_KUBE_VERSION}' \
+                            --set image.repository='${env.IMAGE_REPO}' \
+                            --set image.tag='${env.IMAGE_TAG}' \
+                            --set 'imagePullSecrets[0]=${env.PULL_SECRET_NAME}'
+                        # Without a cluster, helm template assumes an old Kubernetes version that the chart rejects.
+                        helm template '${params.RELEASE_NAME}' ./helm ${valuesArg} \
+                            --kube-version '${params.TARGET_KUBE_VERSION}' \
+                            --namespace '${params.NAMESPACE}' \
+                            --set image.repository='${env.IMAGE_REPO}' \
+                            --set image.tag='${env.IMAGE_TAG}' \
+                            --set 'imagePullSecrets[0]=${env.PULL_SECRET_NAME}' > rendered-manifests.yaml
+                        # The app version is the image tag, so the packaged chart defaults to the image built here.
+                        helm package ./helm --destination dist \
+                            --version '${env.CHART_VERSION}' \
+                            --app-version '${env.IMAGE_TAG}'
+                    """
+                }
+                archiveArtifacts artifacts: 'rendered-manifests.yaml, dist/*.tgz', fingerprint: true
+            }
+        }
+
+        stage('Build image') {
+            steps {
+                // The Dockerfile builds linux/amd64 binaries.
+                sh 'docker build --pull --platform linux/amd64 -t "$IMAGE_REF" .'
+            }
+        }
+
+        stage('Publish to Harbor') {
+            when {
+                beforeAgent true
+                expression { params.DEPLOY && env.IS_CHANGE_REQUEST != 'true' }
+            }
+            steps {
+                withCredentials([usernamePassword(credentialsId: env.DOCKER_REG_CREDS,
+                                                  usernameVariable: 'HARBOR_USER',
+                                                  passwordVariable: 'HARBOR_PASSWORD')]) {
+                    sh '''
+                        echo "$HARBOR_PASSWORD" | docker login "$DOCKER_REG" -u "$HARBOR_USER" --password-stdin
+                        docker push "$IMAGE_REF"
+
+                        echo "$HARBOR_PASSWORD" | helm registry login "$DOCKER_REG" -u "$HARBOR_USER" --password-stdin
+                        helm push "dist/${CHART_NAME}-${CHART_VERSION}.tgz" "$CHART_REPO"
+                    '''
+                }
+            }
+        }
+
+        stage('Deploy') {
+            when {
+                beforeAgent true
+                expression { params.DEPLOY && env.IS_CHANGE_REQUEST != 'true' }
+            }
+            steps {
+                withCredentials([file(credentialsId: params.KUBECONFIG_CREDENTIALS_ID, variable: 'KUBECONFIG'),
+                                 usernamePassword(credentialsId: env.DOCKER_REG_CREDS,
+                                                  usernameVariable: 'HARBOR_USER',
+                                                  passwordVariable: 'HARBOR_PASSWORD')]) {
+                    script {
+                        def ctx = params.KUBE_CONTEXT?.trim() ? "--kube-context '${params.KUBE_CONTEXT.trim()}'" : ''
+                        def valuesArg = params.HELM_VALUES_FILE?.trim() ? "-f '${params.HELM_VALUES_FILE.trim()}'" : ''
+                        withEnv(["KUBE_CTX=${params.KUBE_CONTEXT?.trim() ?: ''}", "TARGET_NS=${params.NAMESPACE}"]) {
+                            // Harbor is private: the nodes pull the operator image with a dockerconfigjson Secret
+                            // built from harbor-creds. The JSON is written to a private file, so the password
+                            // never appears on a command line, and the Secret is created or updated in place.
+                            sh '''
+                                kubectl ${KUBE_CTX:+--context "$KUBE_CTX"} version
+                                kubectl ${KUBE_CTX:+--context "$KUBE_CTX"} create namespace "$TARGET_NS" --dry-run=client -o yaml | kubectl ${KUBE_CTX:+--context "$KUBE_CTX"} apply -f -
+
+                                umask 077
+                                AUTH=$(printf '%s:%s' "$HARBOR_USER" "$HARBOR_PASSWORD" | base64 | tr -d '\\n')
+                                printf '{"auths":{"%s":{"auth":"%s"}}}' "$DOCKER_REG" "$AUTH" > .ci/pull-secret.json
+                                kubectl ${KUBE_CTX:+--context "$KUBE_CTX"} -n "$TARGET_NS" create secret generic "$PULL_SECRET_NAME" \
+                                    --type=kubernetes.io/dockerconfigjson \
+                                    --from-file=.dockerconfigjson=.ci/pull-secret.json \
+                                    --dry-run=client -o yaml | kubectl ${KUBE_CTX:+--context "$KUBE_CTX"} apply -f -
+                                rm -f .ci/pull-secret.json
+                            '''
+                        }
+                        // Same install as the main README, using the image just pushed to Harbor.
+                        // The chart manages the CRD and cluster-wide RBAC, so this kubeconfig needs cluster-admin rights.
+                        sh """
+                            helm upgrade --install '${params.RELEASE_NAME}' ./helm ${ctx} ${valuesArg} \
+                                --namespace '${params.NAMESPACE}' --create-namespace \
+                                --set image.repository='${env.IMAGE_REPO}' \
+                                --set image.tag='${env.IMAGE_TAG}' \
+                                --set 'imagePullSecrets[0]=${env.PULL_SECRET_NAME}' \
+                                --wait --timeout '${env.HELM_TIMEOUT}'
+                        """
+                    }
+                }
+            }
+        }
+
+        stage('Verify') {
+            when {
+                beforeAgent true
+                expression { params.DEPLOY && env.IS_CHANGE_REQUEST != 'true' }
+            }
+            steps {
+                withCredentials([file(credentialsId: params.KUBECONFIG_CREDENTIALS_ID, variable: 'KUBECONFIG')]) {
+                    script {
+                        def kctx = params.KUBE_CONTEXT?.trim() ? "--context '${params.KUBE_CONTEXT.trim()}'" : ''
+                        def ctx = params.KUBE_CONTEXT?.trim() ? "--kube-context '${params.KUBE_CONTEXT.trim()}'" : ''
+                        sh """
+                            kubectl ${kctx} -n '${params.NAMESPACE}' rollout status deployment/'${env.DEPLOYMENT_NAME}' --timeout=5m
+                            kubectl ${kctx} get crd hpapluses.hpa.plus
+                            kubectl ${kctx} -n '${params.NAMESPACE}' get deployment '${env.DEPLOYMENT_NAME}' \
+                                -o jsonpath='{.spec.template.spec.containers[*].image}{"\\n"}'
+                            helm ${ctx} -n '${params.NAMESPACE}' status '${params.RELEASE_NAME}'
+                        """
+                    }
+                }
+            }
+        }
+    }
+
+    post {
+        failure {
+            script {
+                if (params.DEPLOY && env.IS_CHANGE_REQUEST != 'true') {
+                    // Best-effort diagnostics; never mask the original failure.
+                    try {
+                        withCredentials([file(credentialsId: params.KUBECONFIG_CREDENTIALS_ID, variable: 'KUBECONFIG')]) {
+                            def kctx = params.KUBE_CONTEXT?.trim() ? "--context '${params.KUBE_CONTEXT.trim()}'" : ''
+                            sh """
+                                kubectl ${kctx} -n '${params.NAMESPACE}' get pods -l name='${env.DEPLOYMENT_NAME}' -o wide || true
+                                kubectl ${kctx} -n '${params.NAMESPACE}' describe deployment '${env.DEPLOYMENT_NAME}' || true
+                                kubectl ${kctx} -n '${params.NAMESPACE}' logs deployment/'${env.DEPLOYMENT_NAME}' --all-containers --tail=200 || true
+                                kubectl ${kctx} -n '${params.NAMESPACE}' get events --sort-by=.lastTimestamp | tail -n 40 || true
+                            """
+                        }
+                    } catch (err) {
+                        echo "Could not collect cluster diagnostics: ${err}"
+                    }
+                }
+            }
+        }
+        always {
+            sh '''
+                docker logout "$DOCKER_REG" >/dev/null 2>&1 || true
+                helm registry logout "$DOCKER_REG" >/dev/null 2>&1 || true
+                rm -rf .ci
+                # Remove the local image so agents do not fill up; the pushed image stays in Harbor.
+                if [ -n "$IMAGE_REF" ]; then docker image rm "$IMAGE_REF" >/dev/null 2>&1 || true; fi
+            '''
+        }
+    }
+}
