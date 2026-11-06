@@ -72,7 +72,7 @@ The main README installs the operator in three steps. The pipeline runs the same
 | Stage | What happens |
 | --- | --- |
 | 🧭 **Prepare** | Builds the image and chart references and the chart version from `helm/Chart.yaml` and the commit SHA. Fails early if `HELM_VALUES_FILE` points to a missing file. |
-| 🧪 **Test** | Runs two jobs in parallel inside throwaway containers.<br/>🐹 **Go:** `go vet ./...` and `go test ./...` in the same `golang` image as the Dockerfile.<br/>🐍 **Python:** installs the hash-pinned `algorithms/requirements.txt` into a venv, runs `pytest` and publishes JUnit reports.<br/>Skip with `RUN_TESTS=false`. |
+| 🧪 **Test** | Runs two jobs in parallel in throwaway `docker run` containers that mount the workspace and run as the Jenkins user.<br/>🐹 **Go:** `go vet ./...` and `go test ./...` in the same `golang` image as the Dockerfile.<br/>🐍 **Python:** installs the hash-pinned `algorithms/requirements.txt` into a venv, runs `pytest` and publishes JUnit reports.<br/>Skip with `RUN_TESTS=false`. |
 | ⎈ **Helm checks & package** | Runs `helm lint` and `helm template` with the Harbor image, then `helm package` with the CI chart version. Archives `rendered-manifests.yaml` and the chart `.tgz` with the build. |
 | 🐳 **Build image** | `docker build --platform linux/amd64` from the repository `Dockerfile`. |
 | 📤 **Publish to Harbor** | Logs in with `harbor-creds`, then pushes the image with `docker push` and the chart with `helm push`. |
@@ -115,7 +115,6 @@ DOCKER_REPO      = '/hpa-plus/'
 ### 🧩 Jenkins plugins
 
 - ✔️ Pipeline (declarative), plus Pipeline: Multibranch for multibranch jobs
-- ✔️ Docker Pipeline: runs the test stages in containers
 - ✔️ Credentials Binding
 - ✔️ JUnit
 - ✔️ Timestamper
@@ -124,7 +123,7 @@ DOCKER_REPO      = '/hpa-plus/'
 
 The agent selected by `AGENT_LABEL` (default `cop-pilot-staging-cluster`) needs:
 
-- 🐳 **Docker**, usable by the Jenkins user, able to build `linux/amd64` images
+- 🐳 **Docker**, usable by the Jenkins user (for example in the `docker` group), able to build `linux/amd64` images and to bind-mount the build workspace into containers
 - ⎈ **helm 3.8+** (for OCI `helm push`) and ☸️ **kubectl** on the `PATH`
 - 🌐 Network access to Docker Hub (base images), `harbor.cop-pilot.rid-intrasoft.eu` and the cluster API server
 

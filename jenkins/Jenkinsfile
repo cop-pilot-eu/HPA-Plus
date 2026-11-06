@@ -89,49 +89,46 @@ pipeline {
         stage('Test') {
             when { expression { params.RUN_TESTS } }
             parallel {
+                // Tests run in plain `docker run` containers (no Docker Pipeline plugin needed). The workspace is
+                // mounted at /src and the container runs as the Jenkins user, so every file it writes stays
+                // owned by Jenkins and can be cleaned up.
                 stage('Go') {
-                    agent {
-                        docker {
-                            // Same Go toolchain as the Dockerfile builder stage.
-                            image 'golang:1.27.1@sha256:3680233e3204827fbdc66088528ae6d4b3d034f51d03a99d454f6de034888244'
-                            reuseNode true
-                        }
-                    }
-                    environment {
-                        // The container runs as the Jenkins user, so keep caches in the workspace.
-                        GOPATH = "${WORKSPACE}/.cache/go"
-                        GOCACHE = "${WORKSPACE}/.cache/go-build"
-                        GOMODCACHE = "${WORKSPACE}/.cache/go-mod"
-                        GOFLAGS = '-buildvcs=false'
-                    }
                     steps {
                         sh '''
-                            go version
-                            go vet ./...
-                            go test ./...
+                            mkdir -p .cache/go .cache/go-build .cache/go-mod .cache/home
+                            # Same Go toolchain as the Dockerfile builder stage.
+                            docker run --rm --init \
+                                -u "$(id -u):$(id -g)" \
+                                -v "$WORKSPACE:/src" -w /src \
+                                -e HOME=/src/.cache/home \
+                                -e GOPATH=/src/.cache/go \
+                                -e GOCACHE=/src/.cache/go-build \
+                                -e GOMODCACHE=/src/.cache/go-mod \
+                                -e GOFLAGS=-buildvcs=false \
+                                golang:1.27.1@sha256:3680233e3204827fbdc66088528ae6d4b3d034f51d03a99d454f6de034888244 \
+                                sh -ec 'go version && go vet ./... && go test ./...'
                         '''
                     }
                 }
                 stage('Python') {
-                    agent {
-                        docker {
-                            // Same Python as the runtime image; the full variant already ships libgomp1 for XGBoost/LightGBM.
-                            image 'python:3.14.7-trixie'
-                            reuseNode true
-                        }
-                    }
-                    environment {
-                        PIP_CACHE_DIR = "${WORKSPACE}/.cache/pip"
-                        PIP_DISABLE_PIP_VERSION_CHECK = '1'
-                    }
                     steps {
                         sh '''
-                            python -m venv .venv
-                            . .venv/bin/activate
-                            pip install --require-hashes -r algorithms/requirements.txt
-                            pip install pytest==9.1.1
-                            pytest --import-mode=importlib algorithms/ \
-                                --junitxml=python-test-results.xml
+                            mkdir -p .cache/pip .cache/home
+                            # Same Python as the runtime image; the full variant already ships libgomp1 for XGBoost/LightGBM.
+                            docker run --rm --init \
+                                -u "$(id -u):$(id -g)" \
+                                -v "$WORKSPACE:/src" -w /src \
+                                -e HOME=/src/.cache/home \
+                                -e PIP_CACHE_DIR=/src/.cache/pip \
+                                -e PIP_DISABLE_PIP_VERSION_CHECK=1 \
+                                python:3.14.7-trixie \
+                                sh -ec '
+                                    python -m venv .venv
+                                    . .venv/bin/activate
+                                    pip install --require-hashes -r algorithms/requirements.txt
+                                    pip install pytest==9.1.1
+                                    pytest --import-mode=importlib algorithms/ --junitxml=python-test-results.xml
+                                '
                         '''
                     }
                     post {
